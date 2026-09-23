@@ -1,0 +1,463 @@
+// Meridian multi-tenant schema.
+// Every table is owned by a Telegram user, referenced via the literal `telegramId`
+// column (FK -> User.telegramId), so every row is unambiguously scoped to one
+// Telegram account. Config is stored as JSON per logical section (mirrors the
+// nested shape of config.js / user-config.example.json) so no field is lost and
+// new fields can be added without a migration for every single key.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Core identity ────────────────────────────────────────────────────────
+
+model User {
+  telegramId       String    @id // Telegram numeric user id, stringified — the tenant key
+  telegramUsername String?
+  firstName        String?
+  lastName         String?
+  languageCode     String?
+  agentEnabled     Boolean   @default(false) // must be explicitly turned on after wallet+config are set
+  dryRun           Boolean   @default(false) // live-mode default matches the legacy configuration
+  isBlocked        Boolean   @default(false) // admin kill-switch for abuse, does not delete data
+  onboardedAt      DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  wallets            Wallet[]
+  config             UserConfig?
+  secrets            UserSecret?
+  positions          Position[]
+  positionEvents     PositionEvent[]
+  decisionLogs       DecisionLog[]
+  lessons            Lesson[]
+  performanceRecords PerformanceRecord[]
+  signalWeight       SignalWeight?
+  smartWallets       SmartWallet[]
+  strategies         Strategy[]
+  tokenBlacklist     TokenBlacklistEntry[]
+  devBlocklist       DevBlocklistEntry[]
+  poolMemories       PoolMemory[]
+  hiveMindCache      HiveMindCache?
+  briefingState      BriefingState?
+
+  @@map("users")
+}
+
+// ─── Wallet custody ──────────────────────────────────────────────────────
+// Private key is AES-256-GCM encrypted with a server-side master key that never
+// enters the database. See crypto/wallet-vault.js. Admins with DB access only
+// ever see ciphertext; the master key file (secrets/wallet.master.key, mode 600)
+// is the only thing that can decrypt it, and it is only read by the trading
+// process itself — never returned by any API/bot response.
+
+model Wallet {
+  id                  String    @id @default(cuid())
+  telegramId          String
+  user                User      @relation(fields: [telegramId], references: [telegramId], onDelete: Cascade)
+  publicKey           String    @unique
+  encryptedPrivateKey String // JSON bundle: {v, iv, tag, ciphertext} all base64
+  isActive            Boolean   @default(false)
+  keyVersion          Int       @default(1) // master key version used to encrypt (supports rotation)
+  createdAt           DateTime  @default(now())
+  lastExportedAt      DateTime?
+  exportCount         Int       @default(0)
+
+  @@unique([telegramId, publicKey])
+  @@index([telegramId, isActive])
+  @@map("wallets")
+}
+
+// ─── Per-user configuration ─────────────────────────────────────────────
+// One JSON column per config.js section. Application layer applies the exact
+// same default-merging logic that config.js used to apply to user-config.json,
+// just sourced from these columns instead of a file.
+
+model UserConfig {
+  telegramId String @id
+  user       User   @relation(fields: [telegramId], references: [telegramId], onDelete: Cascade)
+
+  risk                Json @default("{}")
+  screening           Json @default("{}")
+  management          Json @default("{}")
+  strategy            Json @default("{}")
+  schedule            Json @default("{}")
+  llm                 Json @default("{}")
+  darwin              Json @default("{}")
+  hiveMind            Json @default("{}")
+  api                 Json @default("{}")
+  pnl                 Json @default("{}")
+  opportunity         Json @default("{}")
+  gmgn                Json @default("{}")
+  indicators          Json @default("{}")
+  technicalAnalysis   Json @default("{}")
+  riskManagement      Json @default("{}")
+  onChainIntelligence Json @default("{}")
+  execution           Json @default("{}")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("user_configs")
+}
+
+// ─── Per-user secrets (API keys / RPC URLs) — encrypted at rest ─────────
+// Every field the user pays for themselves. Encrypted with the same vault
+// mechanism as the wallet (separate key label), decrypted only in-process.
+
+model UserSecret {
+  telegramId String @id
+  user       User   @relation(fields: [telegramId], references: [telegramId], onDelete: Cascade)
+
+  rpcUrlEnc           String?
+  pnlRpcUrlEnc        String?
+  heliusApiKeyEnc     String?
+  llmBaseUrlEnc       String?
+  llmApiKeyEnc        String?
+  openrouterApiKeyEnc String?
+  gmgnApiKeyEnc       String?
+  lpAgentApiKeyEnc    String?
+  hiveMindApiKeyEnc   String?
+  publicApiKeyEnc     String?
+  agentMeridianApiUrl String? // not secret, plain URL override
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("user_secrets")
+}
+
+// ─── Positions (replaces state.json positions{}) ────────────────────────
+
+model Position {
+  id         String @id @default(cuid())
+  telegramId String
+  user       User   @relation(fields: [telegramId], references: [telegramId], onDelete: Cascade)
+
+  positionAddress   String
+  pool              String
+  poolName          String?
+  strategy          String?
+  binRange          Json?
+  amountSol         Float?
+  amountX           Float   @default(0)
+  activeBinAtDeploy Int?
+  binStep           Int?
+  volatility        Float?
+  feeTvlRatio       Float?
+  initialFeeTvl24h  Float?
+  organicScore      Float?
+  initialValueUsd   Float?
+  entryMcap         Float?
+  entryTvl          Float?
+  entryVolume       Float?
+  entryHolders      Int?
+  signalSnapshot    Json?
+
+  deployedAt          DateTime  @default(now())
+  outOfRangeSince     DateTime?
+  lastClaimAt         DateTime?
+  totalFeesClaimedUsd Float     @default(0)
+  rebalanceCount      Int       @default(0)
+  closed              Boolean   @default(false)
+  closedAt            DateTime?
+  notes               String[]  @default([])
+
+  peakPnlPct              Float     @default(0)
+  pendingPeakPnlPct       Float?
+  pendingPeakConfirmCount Int       @default(0)
+  pendingPeakStartedAt    DateTime?
+  pendingExitAction       String?
+  pendingExitCount        Int       @default(0)
+  pendingExitStartedAt    DateTime?
+  trailingActive          Boolean   @default(false)
+
+  instruction String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([telegramId, positionAddress])
+  @@index([telegramId, closed])
+  @@map("positions")
+}
+
+// ─── Recent event feed (replaces state.json recentEvents[]) ────────────
+
+model PositionEvent {
+  id         String @id @default(cuid())
+  telegramId String
+  user       User   @relation(fields: [telegramId], references: [telegramId], onDelete: Cascade)
+
+  ts       DateTime @default(now())
+  action   String
+  position String?
+  poolName String?
+  reason   String?
+
+  @@index([telegramId, ts])
+  @@map("position_events")
+}
+
+// ─── Decision log ────────────────────────────────────────────────────────
+
+model DecisionLog {
+  id         String @id @default(cuid())
+  telegramId String
+  user       User   @relation(fields: [telegramId], references: [telegramId], onDelete: Cascade)
+
+  ts       DateTime @default(now())
+  type     String
+  actor    String
+  pool     String?
+  poolName String?
+  position String?
+  summary  String?
+  reason   String?
+  risks    String[] @default([])
+  metrics  Json?
+  rejected String[] @default([])
+
+  @@index([telegramId, ts])
+  @@map("decision_logs")
+}
+
+// ─── Lessons + performance history ──────────────────────────────────────
+
+model Lesson {
+  id         String @id @default(cuid())
+  telegramId String
+  user       User   @relation(fields: [telegramId], references: [telegramId], onDelete: Cascade)
+
+  rule      String
+  tags      String[] @default([])
+  role      String?
+  outcome   String?
+  source    String   @default("local") // local | manual | performance | config_change | hivemind
+  score     Float?
+  pinned    Boolean  @default(false)
+  metadata  Json? // derived-lesson context: confidence, pnl_pct, fees, pool, entry/exit market data, etc.
+  createdAt DateTime @default(now())
+
+  @@index([telegramId])
+  @@map("lessons")
+}
+
+model PerformanceRecord {
+  id         String @id @default(cuid())
+  telegramId String
+  user       User   @relation(fields: [telegramId], references: [telegramId], onDelete: Cascade)
+
+  position        String
+  pool            String
+  poolName        String?
+  strategy        String?
+  binRange        Json?
+  binStep         Int?
+  volatility      Float?
+  feeTvlRatio     Float?
+  organicScore    Float?
+  amountSol       Float?
+  feesEarnedUsd   Float?
+  feesEarnedSol   Float?
+  finalValueUsd   Float?
+  initialValueUsd Float?
+  minutesInRange  Int?
+  minutesHeld     Int?
+  closeReason     String?
+  pnlUsd          Float?
+  pnlPct          Float?
+  rangeEfficiency Float?
+  signalSnapshot  Json?
+  baseMint        String?
+  entryMcap       Float?
+  entryTvl        Float?
+  entryVolume     Float?
+  exitMcap        Float?
+  exitTvl         Float?
+  exitVolume      Float?
+  deployedAt      DateTime?
+  recordedAt      DateTime  @default(now())
+
+  @@index([telegramId, recordedAt])
+  @@map("performance_records")
+}
+
+// ─── Darwinian signal weights (1:1 per user) ────────────────────────────
+
+model SignalWeight {
+  telegramId String @id
+  user       User   @relation(fields: [telegramId], references: [telegramId], onDelete: Cascade)
+
+  weights     Json      @default("{}")
+  lastRecalc  DateTime?
+  recalcCount Int       @default(0)
+  history     Json      @default("[]")
+
+  @@map("signal_weights")
+}
+
+// ─── Smart wallet watchlist ──────────────────────────────────────────────
+
+model SmartWallet {
+  id         String @id @default(cuid())
+  telegramId String
+  user       User   @relation(fields: [telegramId], references: [telegramId], onDelete: Cascade)
+
+  name     String?
+  address  String
+  category String?
+  type     String?
+  addedAt  DateTime @default(now())
+
+  @@unique([telegramId, address])
+  @@map("smart_wallets")
+}
+
+// ─── Strategy library ────────────────────────────────────────────────────
+
+model Strategy {
+  id         String @id @default(cuid())
+  telegramId String
+  user       User   @relation(fields: [telegramId], references: [telegramId], onDelete: Cascade)
+
+  strategyKey   String // app-level id, e.g. "custom_ratio_spot"
+  name          String
+  author        String?
+  lpStrategy    String?
+  tokenCriteria Json?
+  entry         Json?
+  range         Json?
+  exit          Json?
+  bestFor       String?
+  raw           String?
+  isActive      Boolean  @default(false)
+  addedAt       DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@unique([telegramId, strategyKey])
+  @@map("strategies")
+}
+
+// ─── Blacklists ──────────────────────────────────────────────────────────
+
+model TokenBlacklistEntry {
+  id         String @id @default(cuid())
+  telegramId String
+  user       User   @relation(fields: [telegramId], references: [telegramId], onDelete: Cascade)
+
+  mint    String
+  symbol  String?
+  reason  String?
+  addedAt DateTime @default(now())
+  addedBy String   @default("user") // agent | user
+
+  @@unique([telegramId, mint])
+  @@map("token_blacklist_entries")
+}
+
+model DevBlocklistEntry {
+  id         String @id @default(cuid())
+  telegramId String
+  user       User   @relation(fields: [telegramId], references: [telegramId], onDelete: Cascade)
+
+  wallet  String
+  label   String?
+  reason  String?
+  addedAt DateTime @default(now())
+
+  @@unique([telegramId, wallet])
+  @@map("dev_blocklist_entries")
+}
+
+// ─── Pool memory ─────────────────────────────────────────────────────────
+
+model PoolMemory {
+  id         String @id @default(cuid())
+  telegramId String
+  user       User   @relation(fields: [telegramId], references: [telegramId], onDelete: Cascade)
+
+  poolAddress                String
+  name                       String?
+  baseMint                   String?
+  totalDeploys               Int       @default(0)
+  avgPnlPct                  Float?
+  winRate                    Float?
+  adjustedWinRate            Float?
+  adjustedWinRateSampleCount Int?
+  lastDeployedAt             DateTime?
+  lastOutcome                String?
+  notes                      Json      @default("[]") // [{note, added_at}]
+  snapshots                  Json      @default("[]") // rolling live-position trend snapshots
+  cooldownUntil              DateTime?
+  cooldownReason             String?
+  baseMintCooldownUntil      DateTime?
+  baseMintCooldownReason     String?
+  createdAt                  DateTime  @default(now())
+  updatedAt                  DateTime  @updatedAt
+
+  deploys PoolDeploy[]
+
+  @@unique([telegramId, poolAddress])
+  @@map("pool_memories")
+}
+
+model PoolDeploy {
+  id           String     @id @default(cuid())
+  poolMemoryId String
+  poolMemory   PoolMemory @relation(fields: [poolMemoryId], references: [id], onDelete: Cascade)
+  createdAt    DateTime   @default(now())
+
+  deployedAt         DateTime?
+  closedAt           DateTime?
+  pnlPct             Float?
+  pnlUsd             Float?
+  feesEarnedUsd      Float?
+  feesEarnedSol      Float?
+  feeEarnedPct       Float?
+  rangeEfficiency    Float?
+  minutesHeld        Int?
+  closeReason        String?
+  strategy           String?
+  volatilityAtDeploy Float?
+  entryMcap          Float?
+  entryTvl           Float?
+  entryVolume        Float?
+  exitMcap           Float?
+  exitTvl            Float?
+  exitVolume         Float?
+
+  @@index([poolMemoryId])
+  @@map("pool_deploys")
+}
+
+// ─── HiveMind ────────────────────────────────────────────────────────────
+
+model HiveMindCache {
+  telegramId String @id
+  user       User   @relation(fields: [telegramId], references: [telegramId], onDelete: Cascade)
+
+  agentId       String?
+  pullMode      String    @default("auto")
+  sharedLessons Json      @default("[]")
+  presets       Json      @default("[]")
+  pulledAt      DateTime?
+
+  @@map("hivemind_caches")
+}
+
+// ─── Morning briefing dedupe ─────────────────────────────────────────────
+
+model BriefingState {
+  telegramId String @id
+  user       User   @relation(fields: [telegramId], references: [telegramId], onDelete: Cascade)
+
+  lastBriefingDate String? // YYYY-MM-DD
+
+  @@map("briefing_states")
+}
